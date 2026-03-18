@@ -20,8 +20,11 @@ import sys
 app = Flask(__name__)
 
 class WebCameraVLM:
-    def __init__(self):
-        self.camera_url = 0  # 使用本地摄像头
+    def __init__(self, camera_url=None):
+        # 支持RTSP URL或本地摄像头索引
+        # 示例RTSP: "rtsp://username:password@ip:port/path"
+        self.camera_url = camera_url if camera_url is not None else 0
+        self.is_rtsp = isinstance(self.camera_url, str) and self.camera_url.startswith('rtsp://')
         self.model = None
         self.processor = None
         self.running = False
@@ -75,11 +78,91 @@ class WebCameraVLM:
             return False
 
     def connect_camera(self):
-        """连接摄像头"""
+        """连接摄像头 - 支持本地摄像头和RTSP流"""
+        if self.is_rtsp:
+            return self.connect_rtsp_camera()
+        else:
+            return self.connect_local_camera()
+
+    def connect_rtsp_camera(self):
+        """连接RTSP摄像头"""
+        print(f"📡 正在连接RTSP摄像头: {self.camera_url}")
+
+        # RTSP连接选项
+        rtsp_options = [
+            # FFMPEG后端通常对RTSP支持最好
+            cv2.CAP_FFMPEG,
+            cv2.CAP_GSTREAMER,
+            cv2.CAP_ANY
+        ]
+
+        for backend in rtsp_options:
+            try:
+                print(f"📡 尝试后端: {backend}")
+                cap = cv2.VideoCapture(self.camera_url, backend)
+
+                # 设置缓冲区大小以减少延迟
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                # 设置超时
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)  # 10秒连接超时
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)   # 5秒读取超时
+
+                if cap.isOpened():
+                    # 测试读取帧
+                    print("🔍 测试RTSP流...")
+                    ret, test_frame = cap.read()
+
+                    if ret and test_frame is not None:
+                        h, w = test_frame.shape[:2]
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+
+                        print(f"✅ RTSP连接成功: {w}x{h} @{fps}fps")
+                        print(f"📺 摄像头信息:")
+                        print(f"   - 分辨率: {w}x{h}")
+                        print(f"   - 帧率: {fps}")
+                        print(f"   - 编码格式: {cap.get(cv2.CAP_PROP_FOURCC)}")
+
+                        self.cap = cap
+                        self.stats['camera_connected'] = True
+                        return True
+                    else:
+                        print("⚠️ 无法从RTSP流读取帧")
+                        cap.release()
+                else:
+                    print("⚠️ 无法打开RTSP流")
+                    cap.release()
+
+            except Exception as e:
+                print(f"⚠️ RTSP连接失败: {e}")
+                if 'cap' in locals():
+                    cap.release()
+
+        print("❌ 所有RTSP连接尝试都失败了")
+        print("💡 请检查:")
+        print("   1. RTSP URL是否正确")
+        print("   2. 网络连接是否正常")
+        print("   3. 摄像头是否支持RTSP协议")
+        print("   4. 用户名密码是否正确")
+
+        # 失败后使用模拟视频源
+        print("🔄 切换到模拟视频源")
+        self.cap = None
+        self.stats['camera_connected'] = True
+        return True
+
+    def connect_local_camera(self):
+        """连接本地摄像头"""
         print("🔍 正在搜索可用摄像头...")
 
+        # 如果指定了具体索引，优先尝试
+        if isinstance(self.camera_url, int):
+            indices_to_try = [self.camera_url] + [i for i in range(0, 10) if i != self.camera_url]
+        else:
+            indices_to_try = range(0, 10)
+
         # 尝试多个摄像头索引
-        for camera_index in range(0, 10):
+        for camera_index in indices_to_try:
             try:
                 print(f"📡 尝试摄像头索引: {camera_index}")
                 cap = cv2.VideoCapture(camera_index)
@@ -106,6 +189,29 @@ class WebCameraVLM:
 
             except Exception as e:
                 print(f"⚠️ 摄像头{camera_index}测试失败: {e}")
+
+        # 尝试不同的后端
+        backends = [cv2.CAP_V4L2, cv2.CAP_GSTREAMER, cv2.CAP_FFMPEG]
+        backend_names = ["V4L2", "GStreamer", "FFMPEG"]
+
+        for backend, name in zip(backends, backend_names):
+            try:
+                print(f"📡 尝试{name}后端...")
+                cap = cv2.VideoCapture(0, backend)
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    ret, test_frame = cap.read()
+                    if ret and test_frame is not None:
+                        h, w = test_frame.shape[:2]
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                        print(f"✅ {name}后端连接成功: {w}x{h} @{fps}fps")
+                        self.cap = cap
+                        self.camera_url = f"{name}:0"
+                        self.stats['camera_connected'] = True
+                        return True
+                cap.release()
+            except Exception as e:
+                print(f"⚠️ {name}后端失败: {e}")
 
         print("❌ 未找到可用摄像头，使用模拟视频源")
         self.cap = None
@@ -316,8 +422,8 @@ class WebCameraVLM:
 
         print("✅ 系统已停止")
 
-# 全局实例
-camera_system = WebCameraVLM()
+# 全局实例 - 在main函数中创建
+camera_system = None
 
 # Web路由
 @app.route('/')
@@ -500,11 +606,36 @@ def signal_handler(signum, frame):
 
 def main():
     """主函数"""
+    import argparse
+
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='Web版摄像头监控系统 - 支持本地摄像头和RTSP流')
+    parser.add_argument('--rtsp', '-r', type=str,
+                      help='RTSP摄像头URL (例如: rtsp://username:password@192.168.1.100:554/stream)')
+    parser.add_argument('--camera', '-c', type=int, default=0,
+                      help='本地摄像头索引 (默认: 0)')
+    parser.add_argument('--port', '-p', type=int, default=5000,
+                      help='Web服务器端口 (默认: 5000)')
+
+    args = parser.parse_args()
+
     print("🌐 Web版摄像头系统启动中...")
+
+    # 显示使用的摄像头源
+    if args.rtsp:
+        print(f"📡 使用RTSP摄像头: {args.rtsp}")
+        camera_url = args.rtsp
+    else:
+        print(f"📹 使用本地摄像头: 索引{args.camera}")
+        camera_url = args.camera
 
     # 注册信号处理
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # 创建摄像头系统实例
+    global camera_system
+    camera_system = WebCameraVLM(camera_url=camera_url)
 
     # 启动摄像头系统
     if not camera_system.start_system():
@@ -513,11 +644,16 @@ def main():
 
     # 启动Web服务器
     print("🌐 启动Web服务器...")
-    print("📱 打开浏览器访问: http://localhost:5000")
+    print(f"📱 打开浏览器访问: http://localhost:{args.port}")
     print("🛑 按 Ctrl+C 停止服务")
+    print("")
+    print("💡 使用说明:")
+    print("   本地摄像头: python3 web_camera_stream.py --camera 0")
+    print("   RTSP摄像头: python3 web_camera_stream.py --rtsp rtsp://user:pass@ip:port/stream")
+
 
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        app.run(host='0.0.0.0', port=args.port, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n🛑 接收到中断信号")
     finally:
